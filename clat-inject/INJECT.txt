@@ -1,0 +1,78 @@
+CLAT injection — reusable per-container setup
+=============================================
+
+For ANY existing OCI/legacy container that needs an IPv4 outbound socket on an
+IPv6-only Incus host with NAT64 (64:ff9b::/96) upstream.
+
+Prerequisites (one-time, host side; already done on this host)
+--------------------------------------------------------------
+- /opt/clat-inject/ exists and contains:
+    tundra            (static tundra-nat64 binary)
+    tundra.conf.tmpl  (CLAT-mode config; __IPV6__ is filled in at runtime)
+    run.sh            (entrypoint shim)
+    np_proxy          (static helper: `ip -6 neigh add proxy` via netlink)
+- /dev/net/tun exists on the host (it does on any modern kernel).
+- The container's network ACL allows outbound to the internet
+  (on this host: `has-internet`).
+
+
+Per-container, three Incus commands plus the original entrypoint
+----------------------------------------------------------------
+Replace <C> with the container name and <CMD> with the container's original
+shell entrypoint (i.e. whatever the OCI image would have run).
+
+  incus config device add <C> clatinject disk \
+      source=/opt/clat-inject path=/clat-inject readonly=true
+
+  incus config device add <C> tun unix-char \
+      source=/dev/net/tun path=/dev/net/tun
+
+  incus config set <C> oci.entrypoint=/clat-inject/run.sh
+  incus config set <C> environment.CLAT_ORIG_CMD='<CMD>'
+
+If the container's eth0 needs outbound permission:
+
+  incus config device set <C> eth0 security.acls default-network,ingress,has-internet
+
+
+Example: clat-test (docker.io/crccheck/hello-world)
+---------------------------------------------------
+  incus config device add clat-test clatinject disk \
+      source=/opt/clat-inject path=/clat-inject readonly=true
+  incus config device add clat-test tun unix-char \
+      source=/dev/net/tun path=/dev/net/tun
+  incus config set clat-test oci.entrypoint=/clat-inject/run.sh
+  incus config set clat-test environment.CLAT_ORIG_CMD='echo "httpd started" && trap "exit 0;" TERM INT; httpd -v -p $PORT -h /www -f & wait'
+  incus config device set clat-test eth0 security.acls default-network,ingress,has-internet
+  incus start clat-test
+
+
+Verification
+------------
+  incus exec <C> -- ping -c2 1.1.1.1                 # ICMP via CLAT
+  incus exec <C> -- sh -c 'nc -vw5 1.1.1.1 443 </dev/null'   # TCP via CLAT
+  incus exec <C> -- wget -qO- --timeout=8 http://ifconfig.me/
+
+
+How it works (one paragraph)
+----------------------------
+run.sh waits for eth0's GUA, derives a separate CLAT IPv6 in the same /64 as
+a deterministic sibling of the GUA (flips the U/L bit of the IID's first byte,
+so e.g. ...:1266:... -> ...:1066:..., guaranteed not to collide with any
+MAC-derived SLAAC address on the same bridge), starts tundra in CLAT mode with that as
+addressing.nat64_clat.ipv6, points the container's default IPv4 route at the
+tundra TUN, enables IPv6 forwarding + proxy_ndp inside the netns, routes
+<CLAT_V6>/128 into tundra, and adds a proxy-NDP entry on eth0 (via np_proxy)
+so the upstream bridge resolves the address back to the container. The CLAT
+IPv6 is intentionally NOT assigned to any interface — that's what lets the
+kernel forward inbound NAT64 returns into the tundra TUN instead of delivering
+them locally. Finally run.sh execs the original command from $CLAT_ORIG_CMD.
+
+
+Cleanup
+-------
+Nothing to clean up. Everything (tundra TUN, routes, sysctls, the proxy NDP
+entry, the veth) is scoped to the container's network namespace and is
+destroyed when the container stops. The host's neighbor table, routing
+table, and sysctls are untouched. `incus delete <C>` removes the device
+config too. /opt/clat-inject is read-only and never written to.
