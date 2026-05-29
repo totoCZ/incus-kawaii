@@ -177,7 +177,8 @@ def get_instance_ipv6(instance_name: str, iface: str = "eth0") -> str | None:
     if not instances:
         return None
 
-    networks = instances[0].get("state", {}).get("network", {})
+    state = instances[0].get("state") or {}
+    networks = state.get("network") or {}
 
     # Try the specified iface first, then any other (skip loopback).
     candidates = [iface] + [k for k in networks if k not in (iface, "lo")]
@@ -210,9 +211,10 @@ def monitor(dns: TechnitiumClient, cfg: dict) -> None:
     Stream `incus monitor --type lifecycle` and react to events.
     Reconnects automatically on process crash / socket error.
     """
-    iface      = cfg.get("incus", {}).get("interface", "eth0")
-    # Grace period after "started" before IPv6 is assigned (seconds).
-    start_grace = float(cfg.get("incus", {}).get("start_grace_seconds", 4))
+    iface        = cfg.get("incus", {}).get("interface", "eth0")
+    start_grace  = float(cfg.get("incus", {}).get("start_grace_seconds", 4))
+    slaac_retry_interval = float(cfg.get("incus", {}).get("slaac_retry_interval", 3))
+    slaac_retry_timeout  = float(cfg.get("incus", {}).get("slaac_retry_timeout", 30))
 
     log.info("Starting incus monitor loop …")
     while True:
@@ -249,7 +251,6 @@ def monitor(dns: TechnitiumClient, cfg: dict) -> None:
                     dns.delete_aaaa(name)
 
                 elif action in ("instance-started", "instance-updated", "network-state"):
-                    # Give the container a moment to get a SLAAC address.
                     if action == "instance-started":
                         log.debug("Waiting %.0fs for %s to acquire IPv6 …", start_grace, name)
                         time.sleep(start_grace)
@@ -257,10 +258,20 @@ def monitor(dns: TechnitiumClient, cfg: dict) -> None:
                     ipv6 = get_instance_ipv6(name, iface)
                     if ipv6:
                         dns.upsert_aaaa(name, ipv6)
+                    elif action == "instance-started":
+                        # SLAAC may not have completed yet; poll until we get an address.
+                        deadline = time.monotonic() + slaac_retry_timeout
+                        while time.monotonic() < deadline:
+                            time.sleep(slaac_retry_interval)
+                            ipv6 = get_instance_ipv6(name, iface)
+                            if ipv6:
+                                dns.upsert_aaaa(name, ipv6)
+                                break
+                            log.debug("Still no IPv6 for %s, retrying …", name)
+                        else:
+                            log.warning("No global IPv6 found for %s after %.0fs, giving up.", name, slaac_retry_timeout)
                     else:
-                        log.warning(
-                            "No global IPv6 found for %s yet; will retry on next event.", name
-                        )
+                        log.warning("No global IPv6 found for %s, will retry on next event.", name)
 
             proc.wait()
             stderr_out = proc.stderr.read().strip()
