@@ -48,11 +48,46 @@ limits.cpu (cpu count caps) are left alone.
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+# ── design notes / wishlist ────────────────────────────────────────────────────
+#
+# Runtime limit theory
+#   Runtimes with GC or managed thread pools (Go, .NET, JVM, Node, Ruby) probe
+#   the host's CPU count and available memory at startup and size their internal
+#   structures to fit: GC heaps, thread-pool floors, card tables, segment counts.
+#   On a 56-core host a .NET container spawns 56 Server GC heaps + 56 idle
+#   threads whether it handles 1 QPS or 1 000 QPS.  A limits.cpu of 4 is not a
+#   constraint — it is correct configuration that gives the runtime an honest
+#   view of the machine it lives on.
+#
+#   C / Rust / Nim ARC: no runtime inflation.  Limits add OOM risk with no
+#   behavioral benefit.  Only use them for resource partitioning on shared nodes.
+#
+# What this module does (Phase 1 — nudge)
+#   • Memory ceiling: RSS → next power-of-2 GiB anchor.  Generous, not tight.
+#     90 MB RSS → 1 GiB ceiling.  24 GiB RSS → 32 GiB ceiling.
+#     Gives the GC a reference point; it collects before the kernel does.
+#   • CPU count: avg_cores → next even integer ≥ 2.
+#     1.3 avg → 2.  3.1 avg → 4.  Sizes thread-pool floor and GC heap count.
+#   Only fills in *missing* limits; never lowers or removes existing ones.
+#
+# Future work (Phase 2 — feedback controller)
+#   watch  /sys/fs/cgroup/.../memory.events  → memory.high hit count
+#          cpu.stat usage_usec delta         → instantaneous CPU pressure
+#   rules  memory.high events > N in window  → bump ceiling to next anchor
+#          cpu sustained > 80 % for > 30 s  → bump cpu +2
+#          bump count ≥ 3                   → notify human, stop auto-bumping
+#          stability window (6 h calm)      → decay bump counter
+#   .NET note: bumping CPU also grows GC heap count, which increases RSS
+#   baseline — correlate CPU + memory pressure before bumping either axis.
+#
+# ──────────────────────────────────────────────────────────────────────────────
 
 # Only list containers whose placement must be specific.
 # Everything else gets balanced automatically.
@@ -60,6 +95,19 @@ PINNED: dict[str, int] = {
     "geth":     0,
     "grandine": 0,
     "ingress":  0,
+}
+
+# ── resource limit overrides ───────────────────────────────────────────────────
+# Per-container control over automatic limit suggestions.
+#   absent key          → auto-anchor computed from live metrics
+#   value = None        → skip this resource (don't set any limit)
+#   value = str / int   → explicit limit, bypasses auto-anchor
+#
+# Chain nodes with huge page-cache footprints need None for memory: the anchor
+# would fire at e.g. 32 GiB but actual RSS can climb past that legitimately.
+RESOURCE_OVERRIDES: dict[str, dict[str, str | int | None]] = {
+    "geth":     {"memory": None},   # 20–30 GiB page cache; anchor unreliable
+    "grandine": {"memory": None},   # eth consensus client; state size varies
 }
 
 # ── balancer tuning ────────────────────────────────────────────────────────────
@@ -88,6 +136,65 @@ RUNNING_CPU_ESTIMATE_CORES: float = 1.0
 
 def run(cmd: list[str]) -> str:
     return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+
+
+# ── resource anchor helpers ────────────────────────────────────────────────────
+
+_MEM_ANCHORS_GIB: list[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+
+def _memory_anchor_bytes(rss_bytes: int) -> int:
+    """Next power-of-2 GiB ceiling strictly above current RSS. Minimum 1 GiB."""
+    gib = rss_bytes / (1 << 30)
+    for a in _MEM_ANCHORS_GIB:
+        if a > gib:
+            return a * (1 << 30)
+    return _MEM_ANCHORS_GIB[-1] * (1 << 30)
+
+
+def _cpu_anchor(avg_cores: float) -> int:
+    """Round up to next even CPU count, minimum 2."""
+    return max(2, math.ceil(avg_cores / 2) * 2)
+
+
+def _limit_hints(
+    name: str, m: ContainerMetrics, config: dict[str, str]
+) -> tuple[str, str]:
+    """Return (mem_hint, cpu_hint) strings for table display.
+
+    Shows the current limit if already set, the auto-anchor with a leading
+    arrow (→) if the limit is absent, or 'skip' if overridden to None.
+    """
+    overrides = RESOURCE_OVERRIDES.get(name, {})
+    cur_mem = config.get("limits.memory", "")
+    cur_cpu = config.get("limits.cpu", "")
+
+    # Memory column
+    if cur_mem:
+        mem_h = cur_mem
+    elif overrides.get("memory") is None and "memory" in overrides:
+        mem_h = "skip"
+    elif "memory" in overrides and overrides["memory"] is not None:
+        mem_h = f"→{overrides['memory']}"
+    elif m.rss_bytes > 0:
+        ab = _memory_anchor_bytes(m.rss_bytes)
+        mem_h = f"→{ab >> 30}GiB"
+    else:
+        mem_h = "?"
+
+    # CPU column
+    if cur_cpu and cur_cpu.isdigit():
+        cpu_h = cur_cpu
+    elif overrides.get("cpu") is None and "cpu" in overrides:
+        cpu_h = "skip"
+    elif "cpu" in overrides and overrides["cpu"] is not None:
+        cpu_h = f"→{overrides['cpu']}"
+    elif m.cpu_cores > 0:
+        cpu_h = f"→{_cpu_anchor(m.cpu_cores)}"
+    else:
+        cpu_h = "?"
+
+    return mem_h, cpu_h
 
 
 def numa_nodes() -> list[int]:
@@ -549,6 +656,59 @@ def live_cgroup_mems(name: str, target: str) -> bool:
 
 # ── reconcile ──────────────────────────────────────────────────────────────────
 
+def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
+    """Set limits.cpu and limits.memory if not already configured.
+
+    Fills in *missing* limits only — never lowers or removes existing ones.
+    Returns True if any change was made.
+    """
+    overrides = RESOURCE_OVERRIDES.get(name, {})
+    changed = False
+
+    # ── CPU: nudge thread-pool floor and GC heap count ────────────────────────
+    if "cpu" not in overrides:
+        target_cpu: int | None = _cpu_anchor(m.cpu_cores) if m.cpu_cores > 0 else None
+        cpu_label = f"avg {m.cpu_cores:.1f}c → next even"
+    elif overrides["cpu"] is None:
+        target_cpu = None
+        cpu_label = ""
+    else:
+        target_cpu = int(overrides["cpu"])  # type: ignore[arg-type]
+        cpu_label = "override"
+
+    if target_cpu is not None:
+        cur = cfg_get(name, "limits.cpu")
+        if not cur:
+            cfg_set(name, "limits.cpu", str(target_cpu))
+            print(f"  {name}: limits.cpu -> {target_cpu}  ({cpu_label})")
+            changed = True
+
+    # ── Memory: generous ceiling to give GC a collection reference ────────────
+    if "memory" not in overrides:
+        if m.rss_bytes > 0:
+            ab = _memory_anchor_bytes(m.rss_bytes)
+            target_mem: str | None = f"{ab >> 30}GiB"
+            mem_label = f"rss {_fmt_mb(m.rss_bytes)} → next GiB anchor"
+        else:
+            target_mem = None
+            mem_label = ""
+    elif overrides["memory"] is None:
+        target_mem = None
+        mem_label = ""
+    else:
+        target_mem = str(overrides["memory"])
+        mem_label = "override"
+
+    if target_mem is not None:
+        cur = cfg_get(name, "limits.memory")
+        if not cur:
+            cfg_set(name, "limits.memory", target_mem)
+            print(f"  {name}: limits.memory -> {target_mem}  ({mem_label})")
+            changed = True
+
+    return changed
+
+
 def reconcile(
     name: str, target_node: int, devices: dict[str, Any], running: bool
 ) -> tuple[bool, bool]:
@@ -629,6 +789,7 @@ def main() -> int:
     names = [c["name"] for c in containers]
     devices_by_name = {c["name"]: (c.get("expanded_devices") or {}) for c in containers}
     running_by_name = {c["name"]: (c.get("status") == "Running")    for c in containers}
+    configs_by_name = {c["name"]: (c.get("config") or {})           for c in containers}
 
     desired, metrics = assign_smart(containers, nodes)
 
@@ -641,18 +802,24 @@ def main() -> int:
         print(f"  Node {n}: {_fmt_mb(node_mem)} RAM  {node_cpus} CPUs")
     print()
 
-    hdr = f"{'Container':<24} {'State':<8} {'Node':>4}  {'Anon':>9}  {'RSS':>9}  {'CPU avg':>7}  {'Src'}"
+    hdr = (
+        f"{'Container':<24} {'State':<8} {'Node':>4}  {'Anon':>9}  {'RSS':>9}"
+        f"  {'CPU avg':>7}  {'Src':<10}  {'Mem ceil':>10}  {'CPU':>4}"
+    )
     print(hdr)
     print("-" * len(hdr))
     for name in sorted(names):
         m = metrics[name]
-        state = "running" if m.is_running else "stopped"
-        pin   = " [P]" if name in PINNED else ""
+        state   = "running" if m.is_running else "stopped"
+        pin     = " [P]" if name in PINNED else ""
+        src_tag = (m.source_tag + pin)
         rss_col = _fmt_mb(m.rss_bytes) if m.rss_bytes else "        -"
+        mem_h, cpu_h = _limit_hints(name, m, configs_by_name[name])
         print(
             f"  {name:<22} {state:<8} {desired[name]:>4}  "
             f"{_fmt_mb(m.memory_bytes):>9}  {rss_col:>9}  "
-            f"{m.cpu_cores:>6.1f}c  {m.source_tag}{pin}"
+            f"{m.cpu_cores:>6.1f}c  {src_tag:<10}  "
+            f"{mem_h:>10}  {cpu_h:>4}"
         )
     print("-" * len(hdr))
     for n in nodes:
@@ -683,6 +850,7 @@ def main() -> int:
         ch, pages_stale = reconcile(
             name, desired[name], devices_by_name[name], running_by_name[name]
         )
+        ch |= reconcile_limits(name, metrics[name])
         any_changes |= ch
         if pages_stale:
             stale_pages.append(name)
