@@ -142,12 +142,18 @@ def run(cmd: list[str]) -> str:
 
 _MEM_ANCHORS_GIB: list[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 
+# Minimum free fraction above the anchor.  An anchor is only accepted if
+# at least this fraction remains as headroom: anchor × (1 − headroom) ≥ usage.
+# 0.25 means usage must be ≤ 75% of the chosen ceiling; anything higher bumps
+# to the next anchor.  Example: 999 MiB → 2 GiB (not 1 GiB).
+_MEM_ANCHOR_HEADROOM: float = 0.25
 
-def _memory_anchor_bytes(rss_bytes: int) -> int:
-    """Next power-of-2 GiB ceiling strictly above current RSS. Minimum 1 GiB."""
-    gib = rss_bytes / (1 << 30)
+
+def _memory_anchor_bytes(usage_bytes: int) -> int:
+    """Smallest GiB anchor that leaves at least _MEM_ANCHOR_HEADROOM free."""
+    gib = usage_bytes / (1 << 30)
     for a in _MEM_ANCHORS_GIB:
-        if a > gib:
+        if a * (1.0 - _MEM_ANCHOR_HEADROOM) >= gib:
             return a * (1 << 30)
     return _MEM_ANCHORS_GIB[-1] * (1 << 30)
 
@@ -214,8 +220,14 @@ def _memory_ceiling_bytes(
         if overrides["memory"] is None:
             return None
         return _parse_memory_limit(str(overrides["memory"]))
-    if m.rss_bytes > 0:
-        return _memory_anchor_bytes(m.rss_bytes)
+    # Anchor off anon+shmem (the non-reclaimable working set), same source as
+    # NUMA balancing.  RSS includes page cache which the kernel reclaims freely
+    # and would inflate the ceiling for cache-heavy containers unnecessarily.
+    # Fall back to RSS if anon is unavailable (stopped containers).
+    anon = m.memory_bytes if not m.is_estimated else None
+    base = anon if (anon and anon > 0) else (m.rss_bytes if m.rss_bytes > 0 else None)
+    if base:
+        return _memory_anchor_bytes(base)
     return None
 
 
@@ -679,9 +691,10 @@ def live_cgroup_mems(name: str, target: str) -> bool:
 # ── reconcile ──────────────────────────────────────────────────────────────────
 
 def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
-    """Set limits.cpu and limits.memory if not already configured.
+    """Set or raise limits.cpu and limits.memory to match computed anchors.
 
-    Fills in *missing* limits only — never lowers or removes existing ones.
+    Never lowers an existing limit — only sets missing ones or raises when the
+    anchor has grown above what is currently saved in incus.
     Returns True if any change was made.
     """
     overrides = RESOURCE_OVERRIDES.get(name, {})
@@ -700,17 +713,23 @@ def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
 
     if target_cpu is not None:
         cur = cfg_get(name, "limits.cpu")
-        if not cur:
+        cur_int = int(cur) if (cur and cur.isdigit()) else 0
+        if target_cpu > cur_int:
             cfg_set(name, "limits.cpu", str(target_cpu))
-            print(f"  {name}: limits.cpu -> {target_cpu}  ({cpu_label})")
+            arrow = f"{cur_int} → {target_cpu}" if cur_int else str(target_cpu)
+            print(f"  {name}: limits.cpu {arrow}  ({cpu_label})")
             changed = True
 
     # ── Memory: generous ceiling to give GC a collection reference ────────────
     if "memory" not in overrides:
-        if m.rss_bytes > 0:
-            ab = _memory_anchor_bytes(m.rss_bytes)
+        # Use anon (non-reclaimable working set) as anchor input — same source
+        # as NUMA weight and the % display.  Fall back to RSS for stopped containers.
+        anon_b = m.memory_bytes if not m.is_estimated else None
+        base_b = anon_b if (anon_b and anon_b > 0) else (m.rss_bytes or None)
+        if base_b:
+            ab = _memory_anchor_bytes(base_b)
             target_mem: str | None = f"{ab >> 30}GiB"
-            mem_label = f"rss {_fmt_mb(m.rss_bytes)} → next GiB anchor"
+            mem_label = f"{_fmt_mb(base_b).strip()} anon → next GiB anchor"
         else:
             target_mem = None
             mem_label = ""
@@ -723,9 +742,12 @@ def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
 
     if target_mem is not None:
         cur = cfg_get(name, "limits.memory")
-        if not cur:
+        cur_bytes = (_parse_memory_limit(cur) or 0) if cur else 0
+        target_bytes = _parse_memory_limit(target_mem) or 0
+        if target_bytes > cur_bytes:
             cfg_set(name, "limits.memory", target_mem)
-            print(f"  {name}: limits.memory -> {target_mem}  ({mem_label})")
+            arrow = f"{cur} → {target_mem}" if cur else target_mem
+            print(f"  {name}: limits.memory {arrow}  ({mem_label})")
             changed = True
 
     return changed
@@ -839,8 +861,11 @@ def main() -> int:
         rss_col = _fmt_mb(m.rss_bytes) if m.rss_bytes else "        -"
         mem_h, cpu_h = _limit_hints(name, m, cfg)
         ceil_b  = _memory_ceiling_bytes(name, m, cfg)
-        if ceil_b and m.rss_bytes:
-            pct_col = f"{100 * m.rss_bytes / ceil_b:>4.0f}%"
+        # Use anon (working set) as numerator — same source as the ceiling anchor
+        # and NUMA weight.  Page cache is reclaimable and shouldn't inflate %.
+        anon_b  = m.memory_bytes if not m.is_estimated else m.rss_bytes
+        if ceil_b and anon_b:
+            pct_col = f"{100 * anon_b / ceil_b:>4.0f}%"
         else:
             pct_col = "    -"
         print(
