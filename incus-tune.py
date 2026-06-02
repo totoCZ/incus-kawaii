@@ -197,6 +197,28 @@ def _limit_hints(
     return mem_h, cpu_h
 
 
+def _memory_ceiling_bytes(
+    name: str, m: ContainerMetrics, config: dict[str, str]
+) -> int | None:
+    """Ceiling in bytes for the % used calculation.
+
+    Priority: configured limit → explicit override → auto-anchor → None.
+    Returns None when no ceiling is known or the resource is skipped.
+    """
+    overrides = RESOURCE_OVERRIDES.get(name, {})
+    cur_mem = config.get("limits.memory", "")
+
+    if cur_mem:
+        return _parse_memory_limit(cur_mem)
+    if "memory" in overrides:
+        if overrides["memory"] is None:
+            return None
+        return _parse_memory_limit(str(overrides["memory"]))
+    if m.rss_bytes > 0:
+        return _memory_anchor_bytes(m.rss_bytes)
+    return None
+
+
 def numa_nodes() -> list[int]:
     with open("/sys/devices/system/node/online") as f:
         spec = f.read().strip()
@@ -804,22 +826,28 @@ def main() -> int:
 
     hdr = (
         f"{'Container':<24} {'State':<8} {'Node':>4}  {'Anon':>9}  {'RSS':>9}"
-        f"  {'CPU avg':>7}  {'Src':<10}  {'Mem ceil':>10}  {'CPU':>4}"
+        f"  {'CPU avg':>7}  {'Src':<10}  {'Mem ceil':>10}  {'%':>5}  {'CPU':>4}"
     )
     print(hdr)
     print("-" * len(hdr))
     for name in sorted(names):
         m = metrics[name]
+        cfg = configs_by_name[name]
         state   = "running" if m.is_running else "stopped"
         pin     = " [P]" if name in PINNED else ""
         src_tag = (m.source_tag + pin)
         rss_col = _fmt_mb(m.rss_bytes) if m.rss_bytes else "        -"
-        mem_h, cpu_h = _limit_hints(name, m, configs_by_name[name])
+        mem_h, cpu_h = _limit_hints(name, m, cfg)
+        ceil_b  = _memory_ceiling_bytes(name, m, cfg)
+        if ceil_b and m.rss_bytes:
+            pct_col = f"{100 * m.rss_bytes / ceil_b:>4.0f}%"
+        else:
+            pct_col = "    -"
         print(
             f"  {name:<22} {state:<8} {desired[name]:>4}  "
             f"{_fmt_mb(m.memory_bytes):>9}  {rss_col:>9}  "
             f"{m.cpu_cores:>6.1f}c  {src_tag:<10}  "
-            f"{mem_h:>10}  {cpu_h:>4}"
+            f"{mem_h:>10}  {pct_col}  {cpu_h:>4}"
         )
     print("-" * len(hdr))
     for n in nodes:
