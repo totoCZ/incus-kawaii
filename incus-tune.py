@@ -453,9 +453,9 @@ def gather_metrics(
         if running:
             cpu_ns = (state.get("cpu") or {}).get("usage")
             if cpu_ns and cpu_ns > 0:
-                created_at = c.get("created_at", "")
+                started_at = state.get("started_at", "")
                 try:
-                    dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                    dt = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
                     uptime_s = (datetime.now(timezone.utc) - dt).total_seconds()
                     if uptime_s > 60:  # ignore brand-new containers
                         cpu_cores = cpu_ns / 1e9 / uptime_s
