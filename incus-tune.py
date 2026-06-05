@@ -12,16 +12,33 @@ Per container, regardless of running state:
 
   - Network start hook in `raw.lxc`: a container-level `raw.lxc`
     *replaces* the default profile's `raw.lxc` (it does not merge), so we
-    must explicitly carry the right `lxc.hook.start` line here. The line
-    is picked from the container's expanded devices:
+    must explicitly carry the right `lxc.hook.start` line(s) here. They
+    are picked from the container's expanded devices:
 
-      * if `/opt/clat-inject` is mounted, install the CLAT hook
-        (`/clat-inject/run.sh`); that script invokes net-wait itself
-        before bringing CLAT up
+      * if `/opt/clat-inject` is mounted, install two hooks in order:
+        `/net-inject/net-wait` then `/clat-inject/clat-init` — net-wait
+        blocks until the interface is up, then clat-init brings CLAT up
       * else if `/opt/net-inject` is mounted, install the plain
-        net-wait hook (`/net-inject/net-wait`)
+        net-wait hook (`/net-inject/net-wait`) alone
       * else, leave the hook line out — the container hasn't opted into
         either system
+
+    (The CLAT case relies on `/net-inject/net-wait` being present in the
+    container; a profile mounts net-inject alongside clat-inject, so this
+    is guaranteed without us checking for it here.)
+
+  - Memory limits use `limits.memory.enforce = soft` (cgroup v2
+    `memory.high`).  The kernel reclaims page cache and throttles before
+    applying OOM; hard kill is reserved for genuine heap exhaustion, not
+    reclaimable file pages.  The ceiling anchors on full **RSS** (anon +
+    page cache + shmem), not anon alone: a soft limit at or below the
+    resident set makes the kernel reclaim continuously, which starves
+    cache-serving workloads (ingress, prometheus).  The anchor is the
+    smallest power-of-2 GiB tier that clears RSS with headroom, so the
+    soft limit always sits *above* what the container currently holds.
+    Genuinely unbounded page-cache workloads (geth, grandine) opt out
+    with `memory: None`; databases can request extra slack via a
+    per-container `headroom` override.
 
 Placement policy:
   Containers in PINNED go to their assigned node unconditionally.
@@ -31,8 +48,9 @@ Placement policy:
     - Stopped containers fall back to their configured limits.memory, or
       a conservative estimate if unset.
     - Existing placements for *running* containers are preserved unless
-      the inter-node memory imbalance fraction exceeds RUNNING_HYSTERESIS
-      (default 15%). Moving a running container doesn't migrate existing
+      the inter-node pressure imbalance fraction exceeds RUNNING_HYSTERESIS
+      (default 15%): the alternative node must be ≥15% lighter than the
+      one the container is on. Moving a running container doesn't migrate existing
       pages — only new allocations shift — so small gains aren't worth
       the mixed-node period.
     - Stopped containers are freely reassigned; they have no warm pages.
@@ -51,6 +69,8 @@ import json
 import math
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -73,11 +93,23 @@ from typing import Any
 #   • Memory ceiling: RSS → next power-of-2 GiB anchor.  Generous, not tight.
 #     90 MB RSS → 1 GiB ceiling.  24 GiB RSS → 32 GiB ceiling.
 #     Gives the GC a reference point; it collects before the kernel does.
-#   • CPU count: avg_cores → next even integer ≥ 2.
-#     1.3 avg → 2.  3.1 avg → 4.  Sizes thread-pool floor and GC heap count.
+#   • CPU count: cores → next even integer ≥ 2.
+#     1.3 → 2.  3.1 → 4.  Sizes thread-pool floor and GC heap count.
 #   Only fills in *missing* limits; never lowers or removes existing ones.
 #
+# Phase 1.5 — saner CPU counter (done)
+#   The lifetime average (usage_ns / uptime) collapses bursty workloads toward
+#   zero, so the CPU anchor almost never escalated past the floor of 2.  We now
+#   prefer a Prometheus-derived peak — max_over_time of rate(incus_cpu_seconds_
+#   total) — for running containers, falling back to the lifetime average when
+#   Prometheus is unreachable.  Not truly realtime (scrape-interval stale) but a
+#   capacity-honest number.  See fetch_cpu_peak_cores + the PROM_* constants.
+#   Memory deliberately stays on direct cgroup reads: current footprint is
+#   already exact locally, and that path must work with Prometheus down.
+#
 # Future work (Phase 2 — feedback controller)
+#   The Prometheus client opened here is the rail for this: the same source
+#   carries incus_memory_OOM_kills_total and the memory.high event counts.
 #   watch  /sys/fs/cgroup/.../memory.events  → memory.high hit count
 #          cpu.stat usage_usec delta         → instantaneous CPU pressure
 #   rules  memory.high events > N in window  → bump ceiling to next anchor
@@ -99,15 +131,24 @@ PINNED: dict[str, int] = {
 
 # ── resource limit overrides ───────────────────────────────────────────────────
 # Per-container control over automatic limit suggestions.
-#   absent key          → auto-anchor computed from live metrics
-#   value = None        → skip this resource (don't set any limit)
-#   value = str / int   → explicit limit, bypasses auto-anchor
+#   absent key            → auto-anchor computed from live RSS
+#   "memory" = None       → no memory limit at all (unbounded; for genuinely
+#                           unbounded page-cache workloads like chain nodes)
+#   "memory" = str / int  → explicit limit, bypasses auto-anchor
+#   "headroom" = float    → free-fraction the anchor must leave above RSS,
+#                           overriding _MEM_ANCHOR_HEADROOM for this container.
+#                           Raise it to pre-provision slack: a DB whose cache
+#                           should grow *into* the ceiling rather than be
+#                           reclaimed the moment it touches it.
 #
-# Chain nodes with huge page-cache footprints need None for memory: the anchor
-# would fire at e.g. 32 GiB but actual RSS can climb past that legitimately.
-RESOURCE_OVERRIDES: dict[str, dict[str, str | int | None]] = {
-    "geth":     {"memory": None},   # 20–30 GiB page cache; anchor unreliable
-    "grandine": {"memory": None},   # eth consensus client; state size varies
+# Unbounded workloads need None for memory: their RSS (anon + 70+ GiB page
+# cache) is legitimately unbounded, so any finite anchor is wrong.
+RESOURCE_OVERRIDES: dict[str, dict[str, str | int | float | None]] = {
+    "geth":       {"memory": None},     # 20–30 GiB anon + ~70 GiB page cache
+    "grandine":   {"memory": None},     # eth consensus; state size varies
+    "postgresql": {"headroom": 0.5},    # DB: keep the ceiling a tier above RSS
+    "ingress":    {"headroom": 0.5},    # reverse proxy: page cache grows into ceiling
+    "prometheus": {"headroom": 0.5},    # TSDB hot chunks; don't reclaim under soft limit
 }
 
 # ── balancer tuning ────────────────────────────────────────────────────────────
@@ -123,7 +164,10 @@ CPU_WEIGHT: float = 0.4
 # container.  Below this threshold the existing placement wins: moving a
 # running container only shifts future allocations; existing warm pages
 # stay until reclaim, so small gains aren't worth the mixed-node period.
-RUNNING_HYSTERESIS: float = 0.15   # 15 % of normalised pressure range
+# This is a fraction of the heavier node's pressure (scale-free), NOT an
+# absolute pressure-point gap: the alternative node must be at least this
+# much lighter than the node the container currently sits on.
+RUNNING_HYSTERESIS: float = 0.15   # alt node must be ≥15% lighter to move
 
 # Fallback weights for containers where we can't read real metrics.
 STOPPED_MEM_ESTIMATE_MB: int  = 256
@@ -132,10 +176,75 @@ STOPPED_CPU_ESTIMATE_CORES: float = 0.1
 RUNNING_CPU_ESTIMATE_CORES: float = 1.0
 
 
+# ── Prometheus CPU source (Phase 1.5) ───────────────────────────────────────────
+# The incus exporter publishes the very same cgroup counters this script already
+# reads locally — but Prometheus adds the one thing a single cgroup read cannot:
+# the time dimension.  That lets us replace the lifetime-average CPU figure
+# (usage_ns / uptime), which smears bursty workloads toward zero, with a real
+# windowed rate and its peak over a recent horizon.
+#
+# It is the *preferred* CPU signal for running containers, not a replacement:
+# on any failure (timeout, no series, malformed payload) we fall back silently
+# to the local lifetime-average path.  Prometheus is itself a container this
+# script manages, so it must never be a hard dependency — a circular one would
+# brick the reconciler during a Prom outage or a cold host boot.  Disable with
+# `--no-prom` or by blanking PROM_URL.
+PROM_URL: str = "http://prometheus.s.hetmer.net"
+PROM_JOB: str = "incus"
+PROM_CPU_RATE_WINDOW: str  = "5m"   # rate() window for one CPU sample
+PROM_CPU_PEAK_LOOKBACK: str = "6h"  # max_over_time horizon → peak cores for sizing
+PROM_TIMEOUT_S: float = 5.0
+
+
 # ── helpers ────────────────────────────────────────────────────────────────────
 
 def run(cmd: list[str]) -> str:
     return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+
+
+def fetch_cpu_peak_cores(url: str, job: str) -> dict[str, float]:
+    """Per-container peak CPU cores over PROM_CPU_PEAK_LOOKBACK, via Prometheus.
+
+        peak = max_over_time(
+                   sum by (name) (rate(incus_cpu_seconds_total[rate_window]))
+               )[lookback:rate_window]
+
+    Peak (not average) because the only consumer of this number — the limits.cpu
+    anchor — sizes thread-pool floors and GC heap counts, which provision for
+    capacity, not the mean.  For placement it is merely conservative, and CPU is
+    a minor term there anyway.
+
+    Returns {name: cores}.  Empty dict on *any* failure so the caller degrades to
+    the local lifetime-average path.  A genuinely-idle container maps to 0.0 and
+    is *present* in the map; that is deliberately distinct from absent (no data),
+    so gather_metrics does not re-inflate an idle container from its limits.cpu.
+    """
+    if not url:
+        return {}
+    query = (
+        f'max_over_time('
+        f'(sum by (name) (rate(incus_cpu_seconds_total{{job="{job}"}}'
+        f'[{PROM_CPU_RATE_WINDOW}])))'
+        f'[{PROM_CPU_PEAK_LOOKBACK}:{PROM_CPU_RATE_WINDOW}])'
+    )
+    endpoint = f"{url.rstrip('/')}/api/v1/query?" + urllib.parse.urlencode(
+        {"query": query}
+    )
+    try:
+        with urllib.request.urlopen(endpoint, timeout=PROM_TIMEOUT_S) as resp:
+            payload = json.load(resp)
+        if payload.get("status") != "success":
+            return {}
+        out: dict[str, float] = {}
+        for r in payload["data"]["result"]:
+            name = r["metric"].get("name")
+            if name:
+                out[name] = float(r["value"][1])
+        return out
+    except Exception:
+        # Best-effort enrichment: network error, timeout, bad JSON, schema drift
+        # — all degrade to the local path rather than failing the reconcile.
+        return {}
 
 
 # ── resource anchor helpers ────────────────────────────────────────────────────
@@ -149,11 +258,13 @@ _MEM_ANCHORS_GIB: list[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 _MEM_ANCHOR_HEADROOM: float = 0.25
 
 
-def _memory_anchor_bytes(usage_bytes: int) -> int:
-    """Smallest GiB anchor that leaves at least _MEM_ANCHOR_HEADROOM free."""
+def _memory_anchor_bytes(
+    usage_bytes: int, headroom: float = _MEM_ANCHOR_HEADROOM
+) -> int:
+    """Smallest GiB anchor that leaves at least `headroom` free above usage."""
     gib = usage_bytes / (1 << 30)
     for a in _MEM_ANCHORS_GIB:
-        if a * (1.0 - _MEM_ANCHOR_HEADROOM) >= gib:
+        if a * (1.0 - headroom) >= gib:
             return a * (1 << 30)
     return _MEM_ANCHORS_GIB[-1] * (1 << 30)
 
@@ -161,6 +272,23 @@ def _memory_anchor_bytes(usage_bytes: int) -> int:
 def _cpu_anchor(avg_cores: float) -> int:
     """Round up to next even CPU count, minimum 2."""
     return max(2, math.ceil(avg_cores / 2) * 2)
+
+
+def _ceiling_base_bytes(m: "ContainerMetrics") -> int:
+    """Measured resident footprint the memory ceiling anchors on, or 0.
+
+    Full RSS (anon + page cache + shmem), *not* anon alone.  The soft limit
+    (memory.high) must sit above the whole resident set: soft-limiting at or
+    below RSS makes the kernel reclaim continuously, starving cache-serving
+    workloads (ingress, prometheus).
+
+    Returns 0 when there is no measurement (stopped containers).  We must NOT
+    fall back to memory_bytes here: for a stopped container memory_bytes is the
+    configured limit read back as a proxy, and anchoring a limit on itself plus
+    headroom ratchets it up one tier every run (1→2→4 GiB forever).  No
+    measurement → no anchor → leave the existing limit alone.
+    """
+    return m.rss_bytes if m.rss_bytes > 0 else 0
 
 
 def _limit_hints(
@@ -182,8 +310,9 @@ def _limit_hints(
         mem_h = "skip"
     elif "memory" in overrides and overrides["memory"] is not None:
         mem_h = f"→{overrides['memory']}"
-    elif m.rss_bytes > 0:
-        ab = _memory_anchor_bytes(m.rss_bytes)
+    elif _ceiling_base_bytes(m) > 0:
+        headroom = overrides.get("headroom", _MEM_ANCHOR_HEADROOM)
+        ab = _memory_anchor_bytes(_ceiling_base_bytes(m), headroom)
         mem_h = f"→{ab >> 30}GiB"
     else:
         mem_h = "?"
@@ -220,14 +349,12 @@ def _memory_ceiling_bytes(
         if overrides["memory"] is None:
             return None
         return _parse_memory_limit(str(overrides["memory"]))
-    # Anchor off anon+shmem (the non-reclaimable working set), same source as
-    # NUMA balancing.  RSS includes page cache which the kernel reclaims freely
-    # and would inflate the ceiling for cache-heavy containers unnecessarily.
-    # Fall back to RSS if anon is unavailable (stopped containers).
-    anon = m.memory_bytes if not m.is_estimated else None
-    base = anon if (anon and anon > 0) else (m.rss_bytes if m.rss_bytes > 0 else None)
-    if base:
-        return _memory_anchor_bytes(base)
+    # Anchor on full RSS with headroom so the ceiling clears the whole
+    # resident set (page cache included) — the same base reconcile_limits uses.
+    base = _ceiling_base_bytes(m)
+    if base > 0:
+        headroom = overrides.get("headroom", _MEM_ANCHOR_HEADROOM)
+        return _memory_anchor_bytes(base, headroom)
     return None
 
 
@@ -273,9 +400,11 @@ class ContainerMetrics:
     # must not be counted as load (geth fills Node 0 with FS cache which
     # would otherwise push every other container onto Node 1).
     memory_bytes: int
-    # Average CPU cores consumed over the container's lifetime.
-    # Derived from state.cpu.usage_ns / uptime, or limits.cpu if set.
-    # Not instantaneous — but deterministic without a two-sample poll.
+    # Representative CPU cores for a running container.  Prometheus peak
+    # (max_over_time of rate) when reachable; else the lifetime average
+    # state.cpu.usage_ns / uptime.  limits.cpu is a fallback only for a
+    # running-but-unsampled container, and stopped containers fall to a light
+    # estimate (they consume zero).  Not instantaneous either way.
     cpu_cores: float
     # Full memory.current for display; 0 if unavailable.
     rss_bytes: int
@@ -399,6 +528,7 @@ def _node_mem_bytes(node: int) -> int:
 
 def gather_metrics(
     containers: list[dict[str, Any]],
+    cpu_peak: dict[str, float] | None = None,
 ) -> dict[str, ContainerMetrics]:
     """
     Collect dual-axis load metrics for every container.
@@ -409,16 +539,19 @@ def gather_metrics(
       2. limits.memory                           — planning proxy
       3. Built-in estimate
 
-    CPU weight (cpu_cores — average cores over container lifetime):
-      1. state.cpu.usage_ns / uptime_seconds     — from incus list JSON,
-         no extra subprocess, deterministic without two-sample polling
-      2. limits.cpu integer                      — allocation cap as proxy
-      3. Built-in estimate
+    CPU weight (cpu_cores — representative cores, running containers):
+      0. Prometheus peak (cpu_peak arg)          — max_over_time of rate();
+         the real windowed signal, beats every fallback below
+      1. state.cpu.usage_ns / uptime_seconds     — lifetime average from incus
+         list JSON; smears bursts toward zero but needs no Prometheus
+      2. limits.cpu integer                      — cap as proxy, *running
+         containers only* (a stopped cap is not a usage signal)
+      3. Built-in estimate (STOPPED_CPU_ESTIMATE_CORES for stopped)
 
-    cpu_cores is a historical average, not instantaneous.  It is a sound
-    NUMA placement signal: a container averaging 12 cores over its life is
-    more CPU-hungry than one averaging 0.2, even without live sampling.
-    The hysteresis threshold absorbs short-term variation.
+    With Prometheus (tier 0) cpu_cores is a recent peak; without it, a lifetime
+    average.  Either way it is a sound NUMA placement signal — a container that
+    peaks at 12 cores wants its CPUs local more than one that never clears 0.2 —
+    and the hysteresis threshold absorbs short-term variation.
     """
     out: dict[str, ContainerMetrics] = {}
 
@@ -450,7 +583,15 @@ def gather_metrics(
         # ── CPU ───────────────────────────────────────────────────────────────
         cpu_cores: float | None = None
 
-        if running:
+        # Tier 0: Prometheus peak (running containers only).  Presence in the map
+        # is authoritative even at 0.0 — a genuinely-idle container legitimately
+        # peaks at zero, and treating that as "no data" would re-inflate it from
+        # limits.cpu below.  Absent name → no series → fall through to the local
+        # path.  This is real measurement, so is_estimated stays False.
+        if running and cpu_peak is not None and name in cpu_peak:
+            cpu_cores = cpu_peak[name]
+
+        if cpu_cores is None and running:
             cpu_ns = (state.get("cpu") or {}).get("usage")
             if cpu_ns and cpu_ns > 0:
                 started_at = state.get("started_at", "")
@@ -462,7 +603,14 @@ def gather_metrics(
                 except (ValueError, TypeError):
                     pass
 
-        if cpu_cores is None:
+        # limits.cpu is an allocation *cap*, not a usage signal.  It is only a
+        # sane CPU-weight proxy for a *running* container we couldn't sample
+        # (uptime < 60 s, or no usage counter): such a container is actually
+        # consuming CPU, just unmeasured.  A stopped container consumes zero;
+        # weighting it at its cap inflates node pressure with phantom cores
+        # (4 stopped × cap 2 = 8 cores of load that don't exist).  Stopped
+        # containers therefore skip this and fall to the light estimate below.
+        if cpu_cores is None and running:
             raw_cpu = cfg_get(name, "limits.cpu")
             if raw_cpu and raw_cpu.isdigit():
                 cpu_cores = float(raw_cpu)
@@ -532,6 +680,7 @@ def _node_pressure(
 def assign_smart(
     containers: list[dict[str, Any]],
     nodes: list[int],
+    cpu_peak: dict[str, float] | None = None,
 ) -> tuple[dict[str, int], dict[str, ContainerMetrics]]:
     """
     Dual-metric NUMA balancer (memory + CPU) with hysteresis for running
@@ -572,7 +721,7 @@ def assign_smart(
     """
     names = [c["name"] for c in containers]
     running_by_name = {c["name"]: c.get("status") == "Running" for c in containers}
-    metrics = gather_metrics(containers)
+    metrics = gather_metrics(containers, cpu_peak)
     placement: dict[str, int] = {}
 
     def pressure() -> dict[int, float]:
@@ -626,7 +775,13 @@ def assign_smart(
             continue  # already on the lighter side
 
         if running_by_name[name]:
-            imbalance = p[cur_node] - p[best_other]
+            # Relative imbalance: how much lighter the alternative node is as a
+            # fraction of the current (heavier) node's pressure.  We only reach
+            # here when p[best_other] < p[cur_node], so cur_node is the heavier
+            # side and the fraction is in (0, 1].  An absolute pressure-point
+            # gap would never clear 0.15 unless a node were nearly empty, since
+            # total pressures run ~0.1–0.2; the fraction is scale-free.
+            imbalance = (p[cur_node] - p[best_other]) / max(p[cur_node], 1e-9)
             if imbalance <= RUNNING_HYSTERESIS:
                 continue
 
@@ -634,7 +789,7 @@ def assign_smart(
             print(
                 f"  [{name}] rebalancing running container "
                 f"node {cur_node} → {best_other}  "
-                f"pressure delta {imbalance:.3f}  "
+                f"imbalance {imbalance:.0%}  "
                 f"({_fmt_mb(m.memory_bytes)} anon, {m.cpu_cores:.1f} cores avg)"
             )
         # Stopped: no warm pages, move freely.
@@ -720,16 +875,18 @@ def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
             print(f"  {name}: limits.cpu {arrow}  ({cpu_label})")
             changed = True
 
-    # ── Memory: generous ceiling to give GC a collection reference ────────────
+    # ── Memory: soft ceiling sitting above the full resident set ──────────────
     if "memory" not in overrides:
-        # Use anon (non-reclaimable working set) as anchor input — same source
-        # as NUMA weight and the % display.  Fall back to RSS for stopped containers.
-        anon_b = m.memory_bytes if not m.is_estimated else None
-        base_b = anon_b if (anon_b and anon_b > 0) else (m.rss_bytes or None)
-        if base_b:
-            ab = _memory_anchor_bytes(base_b)
+        # Anchor on RSS (full resident set) with per-container headroom so the
+        # soft limit clears page cache + heap.  Anchoring on anon alone would
+        # leave cache-heavy containers (ingress, prometheus) pinned at a ceiling
+        # below their RSS, and soft-enforcing that thrashes the cache.
+        base_b = _ceiling_base_bytes(m)
+        if base_b > 0:
+            headroom = overrides.get("headroom", _MEM_ANCHOR_HEADROOM)
+            ab = _memory_anchor_bytes(base_b, headroom)
             target_mem: str | None = f"{ab >> 30}GiB"
-            mem_label = f"{_fmt_mb(base_b).strip()} anon → next GiB anchor"
+            mem_label = f"{_fmt_mb(base_b).strip()} RSS → next GiB anchor"
         else:
             target_mem = None
             mem_label = ""
@@ -749,6 +906,25 @@ def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
             arrow = f"{cur} → {target_mem}" if cur else target_mem
             print(f"  {name}: limits.memory {arrow}  ({mem_label})")
             changed = True
+
+        # Soft enforcement (cgroup v2 memory.high): kernel reclaims and throttles
+        # before OOM.  Sound *only* when the ceiling sits above RSS — soft-limiting
+        # below the resident set reclaims continuously.  Guard against it: if the
+        # effective limit is under RSS, warn and leave enforcement as-is rather
+        # than flipping a too-tight ceiling to soft.
+        effective_limit = max(cur_bytes, target_bytes)
+        if effective_limit and m.rss_bytes and m.rss_bytes > effective_limit:
+            print(
+                f"  {name}: WARNING limit {_fmt_mb(effective_limit).strip()} "
+                f"< RSS {_fmt_mb(m.rss_bytes).strip()} — not soft-enforcing "
+                f"(would thrash); raise limits.memory or set memory: None"
+            )
+        else:
+            cur_enforce = cfg_get(name, "limits.memory.enforce")
+            if cur_enforce != "soft":
+                cfg_set(name, "limits.memory.enforce", "soft")
+                print(f"  {name}: limits.memory.enforce → soft")
+                changed = True
 
     return changed
 
@@ -835,11 +1011,27 @@ def main() -> int:
     running_by_name = {c["name"]: (c.get("status") == "Running")    for c in containers}
     configs_by_name = {c["name"]: (c.get("config") or {})           for c in containers}
 
-    desired, metrics = assign_smart(containers, nodes)
+    # CPU source: Prometheus peak when reachable, else local lifetime average.
+    use_prom = "--no-prom" not in sys.argv
+    cpu_peak = fetch_cpu_peak_cores(PROM_URL, PROM_JOB) if use_prom else {}
+
+    desired, metrics = assign_smart(containers, nodes, cpu_peak)
 
     # ── diagnostics ────────────────────────────────────────────────────────────
     pressures = _node_pressure(desired, metrics, nodes)
 
+    if not use_prom:
+        print("CPU source: local lifetime-average (--no-prom)")
+    elif cpu_peak:
+        print(
+            f"CPU source: Prometheus peak — {len(cpu_peak)} containers "
+            f"({PROM_CPU_PEAK_LOOKBACK} max of {PROM_CPU_RATE_WINDOW} rate)"
+        )
+    else:
+        print(
+            f"CPU source: local lifetime-average "
+            f"(Prometheus unreachable at {PROM_URL})"
+        )
     print(f"NUMA nodes: {nodes}")
     for n in nodes:
         node_mem, node_cpus = _node_capacity(n)
@@ -848,7 +1040,7 @@ def main() -> int:
 
     hdr = (
         f"{'Container':<24} {'State':<8} {'Node':>4}  {'Anon':>9}  {'RSS':>9}"
-        f"  {'CPU avg':>7}  {'Src':<10}  {'Mem ceil':>10}  {'%':>5}  {'CPU':>4}"
+        f"  {'CPU use':>7}  {'Src':<10}  {'Mem ceil':>10}  {'%':>5}  {'CPU':>4}"
     )
     print(hdr)
     print("-" * len(hdr))
@@ -861,11 +1053,12 @@ def main() -> int:
         rss_col = _fmt_mb(m.rss_bytes) if m.rss_bytes else "        -"
         mem_h, cpu_h = _limit_hints(name, m, cfg)
         ceil_b  = _memory_ceiling_bytes(name, m, cfg)
-        # Use anon (working set) as numerator — same source as the ceiling anchor
-        # and NUMA weight.  Page cache is reclaimable and shouldn't inflate %.
-        anon_b  = m.memory_bytes if not m.is_estimated else m.rss_bytes
-        if ceil_b and anon_b:
-            pct_col = f"{100 * anon_b / ceil_b:>4.0f}%"
+        # Numerator is measured RSS — the same resident set the ceiling anchors
+        # on — so % reads as "how close to the soft limit".  Only shown when we
+        # have a real measurement; for stopped containers memory_bytes is just a
+        # limit proxy and a % off it would be a meaningless 100%.
+        if ceil_b and m.rss_bytes > 0:
+            pct_col = f"{100 * m.rss_bytes / ceil_b:>4.0f}%"
         else:
             pct_col = "    -"
         print(
@@ -892,8 +1085,13 @@ def main() -> int:
 
     if len(nodes) == 2:
         n0, n1 = nodes[0], nodes[1]
-        delta = abs(pressures[n0] - pressures[n1])
-        print(f"  Pressure delta: {delta:.3f}  (hysteresis threshold {RUNNING_HYSTERESIS:.2f})")
+        hi = max(pressures[n0], pressures[n1])
+        lo = min(pressures[n0], pressures[n1])
+        frac = (hi - lo) / max(hi, 1e-9)
+        print(
+            f"  Pressure delta: {hi - lo:.3f}  ({frac:.0%} of heavier node;"
+            f" running-move threshold {RUNNING_HYSTERESIS:.0%})"
+        )
     print()
 
     # ── apply ─────────────────────────────────────────────────────────────────
