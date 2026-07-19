@@ -34,8 +34,9 @@ Per container, regardless of running state:
     page cache + shmem), not anon alone: a soft limit at or below the
     resident set makes the kernel reclaim continuously, which starves
     cache-serving workloads (ingress, prometheus).  The anchor is the
-    smallest power-of-2 GiB tier that clears RSS with headroom, so the
-    soft limit always sits *above* what the container currently holds.
+    smallest power-of-2 GiB tier that clears the larger of current RSS and
+    the cgroup lifetime peak with headroom.  A burst between reconciler runs
+    therefore grows the stable rather than being forgotten.
     Genuinely unbounded page-cache workloads (geth, grandine) opt out
     with `memory: None`; databases can request extra slack via a
     per-container `headroom` override.
@@ -90,12 +91,13 @@ from typing import Any
 #   behavioral benefit.  Only use them for resource partitioning on shared nodes.
 #
 # What this module does (Phase 1 — nudge)
-#   • Memory ceiling: RSS → next power-of-2 GiB anchor.  Generous, not tight.
+#   • Memory ceiling: max(RSS, lifetime peak) → power-of-2 GiB anchor.
 #     90 MB RSS → 1 GiB ceiling.  24 GiB RSS → 32 GiB ceiling.
-#     Gives the GC a reference point; it collects before the kernel does.
-#   • CPU count: cores → next even integer ≥ 2.
-#     1.3 → 2.  3.1 → 4.  Sizes thread-pool floor and GC heap count.
-#   Only fills in *missing* limits; never lowers or removes existing ones.
+#     Gives the kernel a generous reclaim/throttle marker, not an OOM tripwire.
+#   • CPU count: peak cores → even integer ≥ 2 with 25% spare capacity.
+#     1.3 → 2.  1.8 → 4.  3.1 → 6.  A service nearing its cpuset cap
+#     can therefore graduate instead of having the cap hide unmet demand.
+#   Sets missing limits and raises undersized ones; never lowers or removes.
 #
 # Phase 1.5 — saner CPU counter (done)
 #   The lifetime average (usage_ns / uptime) collapses bursty workloads toward
@@ -104,8 +106,8 @@ from typing import Any
 #   total) — for running containers, falling back to the lifetime average when
 #   Prometheus is unreachable.  Not truly realtime (scrape-interval stale) but a
 #   capacity-honest number.  See fetch_cpu_peak_cores + the PROM_* constants.
-#   Memory deliberately stays on direct cgroup reads: current footprint is
-#   already exact locally, and that path must work with Prometheus down.
+#   Memory deliberately stays on direct cgroup reads: current and lifetime-peak
+#   footprints are exact locally, and that path must work with Prometheus down.
 #
 # Future work (Phase 2 — feedback controller)
 #   The Prometheus client opened here is the rail for this: the same source
@@ -124,9 +126,11 @@ from typing import Any
 # Only list containers whose placement must be specific.
 # Everything else gets balanced automatically.
 PINNED: dict[str, int] = {
-    "geth":     0,
-    "grandine": 0,
-    "ingress":  0,
+    "geth":       0,
+    "grandine":   0,
+    "ingress":    0,
+    "clickhouse": 0,
+    "jupyter":    1,
 }
 
 # ── resource limit overrides ───────────────────────────────────────────────────
@@ -257,6 +261,10 @@ _MEM_ANCHORS_GIB: list[int] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 # to the next anchor.  Example: 999 MiB → 2 GiB (not 1 GiB).
 _MEM_ANCHOR_HEADROOM: float = 0.25
 
+# A cpuset hides demand above its own size.  Keeping the same spare fraction as
+# memory lets a service graduate before it is completely flat against the cap.
+_CPU_ANCHOR_HEADROOM: float = 0.25
+
 
 def _memory_anchor_bytes(
     usage_bytes: int, headroom: float = _MEM_ANCHOR_HEADROOM
@@ -269,30 +277,33 @@ def _memory_anchor_bytes(
     return _MEM_ANCHORS_GIB[-1] * (1 << 30)
 
 
-def _cpu_anchor(avg_cores: float) -> int:
-    """Round up to next even CPU count, minimum 2."""
-    return max(2, math.ceil(avg_cores / 2) * 2)
+def _cpu_anchor(peak_cores: float, max_cpus: int | None = None) -> int:
+    """Even CPU tier with headroom, minimum 2 and optionally node-capped."""
+    needed = math.ceil(peak_cores / (1.0 - _CPU_ANCHOR_HEADROOM))
+    target = max(2, math.ceil(needed / 2) * 2)
+    return min(target, max_cpus) if max_cpus is not None else target
 
 
 def _ceiling_base_bytes(m: "ContainerMetrics") -> int:
-    """Measured resident footprint the memory ceiling anchors on, or 0.
+    """Measured high-water resident footprint the ceiling anchors on, or 0.
 
     Full RSS (anon + page cache + shmem), *not* anon alone.  The soft limit
     (memory.high) must sit above the whole resident set: soft-limiting at or
     below RSS makes the kernel reclaim continuously, starving cache-serving
     workloads (ingress, prometheus).
 
-    Returns 0 when there is no measurement (stopped containers).  We must NOT
+    The lifetime peak catches bursts between reconciler runs. Returns 0 when
+    there is no measurement (stopped containers).  We must NOT
     fall back to memory_bytes here: for a stopped container memory_bytes is the
     configured limit read back as a proxy, and anchoring a limit on itself plus
     headroom ratchets it up one tier every run (1→2→4 GiB forever).  No
     measurement → no anchor → leave the existing limit alone.
     """
-    return m.rss_bytes if m.rss_bytes > 0 else 0
+    return max(m.rss_bytes, m.peak_bytes)
 
 
 def _limit_hints(
-    name: str, m: ContainerMetrics, config: dict[str, str]
+    name: str, m: ContainerMetrics, config: dict[str, str], max_cpus: int
 ) -> tuple[str, str]:
     """Return (mem_hint, cpu_hint) strings for table display.
 
@@ -324,10 +335,8 @@ def _limit_hints(
         cpu_h = "skip"
     elif "cpu" in overrides and overrides["cpu"] is not None:
         cpu_h = f"→{overrides['cpu']}"
-    elif m.cpu_cores > 0:
-        cpu_h = f"→{_cpu_anchor(m.cpu_cores)}"
     else:
-        cpu_h = "?"
+        cpu_h = f"→{_cpu_anchor(m.cpu_cores, max_cpus)}"
 
     return mem_h, cpu_h
 
@@ -408,6 +417,8 @@ class ContainerMetrics:
     cpu_cores: float
     # Full memory.current for display; 0 if unavailable.
     rss_bytes: int
+    # Cgroup lifetime memory peak; 0 if unavailable.
+    peak_bytes: int
     is_estimated: bool  # True → some metric fell back to a proxy/estimate
     is_running: bool
 
@@ -564,10 +575,12 @@ def gather_metrics(
         # ── memory ────────────────────────────────────────────────────────────
         mem_weight: int | None = None
         rss: int = 0
+        peak: int = 0
 
         if running:
             mem_weight = _anon_bytes(name)
             rss = _cgroup_int(name, "memory.current") or 0
+            peak = _cgroup_int(name, "memory.peak") or 0
 
         if mem_weight is None:
             raw_limit = cfg_get(name, "limits.memory")
@@ -625,6 +638,7 @@ def gather_metrics(
             memory_bytes=mem_weight,
             cpu_cores=cpu_cores,
             rss_bytes=rss,
+            peak_bytes=peak,
             is_estimated=estimated,
             is_running=running,
         )
@@ -845,7 +859,7 @@ def live_cgroup_mems(name: str, target: str) -> bool:
 
 # ── reconcile ──────────────────────────────────────────────────────────────────
 
-def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
+def reconcile_limits(name: str, m: ContainerMetrics, max_cpus: int) -> bool:
     """Set or raise limits.cpu and limits.memory to match computed anchors.
 
     Never lowers an existing limit — only sets missing ones or raises when the
@@ -857,8 +871,8 @@ def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
 
     # ── CPU: nudge thread-pool floor and GC heap count ────────────────────────
     if "cpu" not in overrides:
-        target_cpu: int | None = _cpu_anchor(m.cpu_cores) if m.cpu_cores > 0 else None
-        cpu_label = f"avg {m.cpu_cores:.1f}c → next even"
+        target_cpu: int | None = _cpu_anchor(m.cpu_cores, max_cpus)
+        cpu_label = f"peak {m.cpu_cores:.1f}c + headroom"
     elif overrides["cpu"] is None:
         target_cpu = None
         cpu_label = ""
@@ -877,8 +891,9 @@ def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
 
     # ── Memory: soft ceiling sitting above the full resident set ──────────────
     if "memory" not in overrides:
-        # Anchor on RSS (full resident set) with per-container headroom so the
-        # soft limit clears page cache + heap.  Anchoring on anon alone would
+        # Anchor on the larger of current RSS and lifetime peak, with
+        # per-container headroom, so the soft limit clears page cache + heap.
+        # Anchoring on anon alone would
         # leave cache-heavy containers (ingress, prometheus) pinned at a ceiling
         # below their RSS, and soft-enforcing that thrashes the cache.
         base_b = _ceiling_base_bytes(m)
@@ -886,7 +901,7 @@ def reconcile_limits(name: str, m: ContainerMetrics) -> bool:
             headroom = overrides.get("headroom", _MEM_ANCHOR_HEADROOM)
             ab = _memory_anchor_bytes(base_b, headroom)
             target_mem: str | None = f"{ab >> 30}GiB"
-            mem_label = f"{_fmt_mb(base_b).strip()} RSS → next GiB anchor"
+            mem_label = f"{_fmt_mb(base_b).strip()} high-water → GiB anchor"
         else:
             target_mem = None
             mem_label = ""
@@ -1039,7 +1054,7 @@ def main() -> int:
     print()
 
     hdr = (
-        f"{'Container':<24} {'State':<8} {'Node':>4}  {'Anon':>9}  {'RSS':>9}"
+        f"{'Container':<24} {'State':<8} {'Node':>4}  {'Anon':>9}  {'RSS':>9}  {'Peak':>9}"
         f"  {'CPU use':>7}  {'Src':<10}  {'Mem ceil':>10}  {'%':>5}  {'CPU':>4}"
     )
     print(hdr)
@@ -1051,7 +1066,9 @@ def main() -> int:
         pin     = " [P]" if name in PINNED else ""
         src_tag = (m.source_tag + pin)
         rss_col = _fmt_mb(m.rss_bytes) if m.rss_bytes else "        -"
-        mem_h, cpu_h = _limit_hints(name, m, cfg)
+        peak_col = _fmt_mb(m.peak_bytes) if m.peak_bytes else "        -"
+        max_cpus = _node_capacity(desired[name])[1]
+        mem_h, cpu_h = _limit_hints(name, m, cfg, max_cpus)
         ceil_b  = _memory_ceiling_bytes(name, m, cfg)
         # Numerator is measured RSS — the same resident set the ceiling anchors
         # on — so % reads as "how close to the soft limit".  Only shown when we
@@ -1064,6 +1081,7 @@ def main() -> int:
         print(
             f"  {name:<22} {state:<8} {desired[name]:>4}  "
             f"{_fmt_mb(m.memory_bytes):>9}  {rss_col:>9}  "
+            f"{peak_col:>9}  "
             f"{m.cpu_cores:>6.1f}c  {src_tag:<10}  "
             f"{mem_h:>10}  {pct_col}  {cpu_h:>4}"
         )
@@ -1101,7 +1119,9 @@ def main() -> int:
         ch, pages_stale = reconcile(
             name, desired[name], devices_by_name[name], running_by_name[name]
         )
-        ch |= reconcile_limits(name, metrics[name])
+        ch |= reconcile_limits(
+            name, metrics[name], _node_capacity(desired[name])[1]
+        )
         any_changes |= ch
         if pages_stale:
             stale_pages.append(name)
