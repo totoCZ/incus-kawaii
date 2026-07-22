@@ -8,8 +8,10 @@ under the zone  x.c.domain.tld
 
 import json
 import logging
+import os
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 from pathlib import Path
@@ -33,6 +35,9 @@ log = logging.getLogger("incus-dns-sync")
 # Config loader
 # ──────────────────────────────────────────────────────────────
 DEFAULT_CONFIG_PATH = Path("/etc/incus-dns-sync/config.toml")
+DEFAULT_SERVICE_CNAME_STATE_PATH = Path(
+    "/var/lib/incus-dns-sync/service-cname-state.json"
+)
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
     with open(path, "rb") as f:
@@ -41,15 +46,128 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
+# Persistent service-CNAME state
+# ──────────────────────────────────────────────────────────────
+class ServiceCnameState:
+    """Remember which live instance names have had their CNAME creation event.
+
+    The state is deliberately local: a service alias becomes admin-owned as
+    soon as its container has first been created.  In particular, a later
+    service restart, an Incus rebuild, or a DNS sync must never recreate an
+    alias an admin has renamed or removed.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.is_new = not path.exists()
+        self.names = self._load()
+
+    def _load(self) -> set[str]:
+        if not self.path.exists():
+            return set()
+        try:
+            with self.path.open(encoding="utf-8") as f:
+                data = json.load(f)
+            names = data.get("created_instances", [])
+            if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+                raise ValueError("created_instances must be a list of strings")
+            log.info("Loaded service-CNAME state for %d instance(s) from %s.",
+                     len(names), self.path)
+            return set(names)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            # Do not risk recreating an admin-managed alias from corrupt state.
+            log.error("Cannot read service-CNAME state %s: %s. CNAME creation is disabled "+
+                      "until this is fixed.", self.path, exc)
+            raise RuntimeError(f"invalid service-CNAME state: {self.path}") from exc
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {"version": 1, "created_instances": sorted(self.names)},
+            indent=2,
+        ) + "\n"
+        temp_name: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", dir=self.path.parent,
+                prefix=f".{self.path.name}.", suffix=".tmp", delete=False,
+            ) as f:
+                temp_name = f.name
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_name, self.path)
+        finally:
+            if temp_name:
+                try:
+                    Path(temp_name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+    def claim_creation(self, name: str) -> bool:
+        """Persist the first-creation claim.  False means it was already claimed."""
+        if name in self.names:
+            return False
+        self.names.add(name)
+        try:
+            # Persist *before* writing DNS, so a process crash cannot make a
+            # later restart recreate an alias after an admin has changed it.
+            self._save()
+        except OSError as exc:
+            self.names.remove(name)
+            log.error("Cannot persist service-CNAME creation state for %s: %s. "
+                      "Not creating a CNAME.", name, exc)
+            return False
+        return True
+
+    def initialize_existing_instances(self, names: list[str]) -> None:
+        """Create the initial baseline without writing any DNS records.
+
+        This is called only when the state file does not yet exist.  It marks
+        every current Incus instance as already past its creation event, so
+        enabling this feature cannot create service aliases for old instances.
+        """
+        if not self.is_new:
+            return
+        self.names.update(names)
+        try:
+            self._save()
+        except OSError as exc:
+            raise RuntimeError(
+                f"cannot create initial service-CNAME state at {self.path}: {exc}"
+            ) from exc
+        self.is_new = False
+        log.info("Created service-CNAME baseline at %s for %d existing instance(s); "
+                 "no CNAMEs were created.", self.path, len(self.names))
+
+    def forget_deleted_instance(self, name: str) -> None:
+        """Allow a genuinely new container reusing this name to be initialized."""
+        if name not in self.names:
+            return
+        self.names.remove(name)
+        try:
+            self._save()
+        except OSError as exc:
+            self.names.add(name)
+            log.error("Cannot update service-CNAME state after deleting %s: %s", name, exc)
+
+
+# ──────────────────────────────────────────────────────────────
 # Technitium API helpers
 # ──────────────────────────────────────────────────────────────
 class TechnitiumClient:
-    def __init__(self, base_url: str, token: str, zone: str, ttl: int = 300, ptr: bool = True):
-        self.base_url = base_url.rstrip("/")
-        self.token    = token
-        self.zone     = zone          # e.g.  x.c.domain.tld
-        self.ttl      = ttl
-        self.ptr      = ptr           # auto-create PTR record via Technitium
+    def __init__(self, base_url: str, token: str, zone: str, ttl: int = 300, ptr: bool = True,
+                 service_zone: str | None = None,
+                 service_cname_state: ServiceCnameState | None = None):
+        self.base_url     = base_url.rstrip("/")
+        self.token        = token
+        self.zone         = zone          # e.g.  c.hetmer.net  (one AAAA per instance)
+        self.ttl          = ttl
+        self.ptr          = ptr           # auto-create PTR record via Technitium
+        # Optional "service" zone. CNAMEs are seeded only from an Incus
+        # instance-created event; subsequent DNS syncs never touch them.
+        self.service_zone = service_zone or None
+        self.service_cname_state = service_cname_state
 
     def _request(self, path: str, params: dict) -> dict:
         params["token"] = self.token
@@ -94,7 +212,10 @@ class TechnitiumClient:
             return []
 
     def upsert_aaaa(self, name: str, ipv6: str) -> None:
-        """Add or update an AAAA record for *name* (short label, not FQDN)."""
+        """
+        Add or update an AAAA record for *name* (short label, not FQDN).
+        Service CNAME handling is intentionally separate from DNS syncing.
+        """
         fqdn = f"{name}.{self.zone}"
         existing = self.list_records(fqdn)
 
@@ -152,10 +273,77 @@ class TechnitiumClient:
                 },
             )
 
+    def seed_service_cname_on_creation(self, name: str) -> None:
+        """
+        Seed a convenience alias only for a newly-created instance. The
+        durable claim happens before contacting DNS, so a restart, rebuild,
+        initial sync, or later lifecycle event cannot recreate an alias after
+        an admin has renamed, repointed, or deleted it.
+
+        Existing records and CNAMEs on deleted instances are never modified.
+        """
+        if not self.service_zone or not self.service_cname_state:
+            return
+        if not self.service_cname_state.claim_creation(name):
+            log.debug("Service CNAME for %s was already handled at creation.", name)
+            return
+
+        alias_fqdn  = f"{name}.{self.service_zone}"
+        target_fqdn = f"{name}.{self.zone}"
+
+        # Fully defensive: any failure here must not break AAAA syncing.
+        try:
+            data = self._request(
+                "/api/zones/records/get",
+                {"domain": alias_fqdn, "zone": self.service_zone},
+            )
+            present = data.get("response", {}).get("records", [])
+
+            if present:
+                cur = present[0].get("type", "?")
+                tgt = present[0].get("rData", {}).get("cname", "?")
+                log.info("CNAME slot %s already in use (%s → %s), leaving untouched.",
+                         alias_fqdn, cur, tgt)
+                return
+
+            log.info("Seeding CNAME %s → %s (TTL %d)", alias_fqdn, target_fqdn, self.ttl)
+            self._request(
+                "/api/zones/records/add",
+                {
+                    "zone":   self.service_zone,
+                    "domain": alias_fqdn,
+                    "type":   "CNAME",
+                    "ttl":    str(self.ttl),
+                    "cname":  target_fqdn,
+                },
+            )
+        except Exception as exc:
+            log.warning("Could not seed CNAME %s: %s", alias_fqdn, exc)
+
 
 # ──────────────────────────────────────────────────────────────
 # Incus helpers
 # ──────────────────────────────────────────────────────────────
+def get_instance_names() -> list[str]:
+    """Return all current Incus instance names for an initial safe baseline."""
+    try:
+        raw = subprocess.check_output(
+            ["incus", "list", "--format", "json"],
+            stderr=subprocess.PIPE,
+            timeout=15,
+        )
+        instances = json.loads(raw)
+        names = [instance["name"] for instance in instances if instance.get("name")]
+        return names
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        FileNotFoundError,
+    ) as exc:
+        raise RuntimeError("cannot list Incus instances for service-CNAME baseline") from exc
+
+
 def get_instance_ipv6(instance_name: str, iface: str = "eth0") -> str | None:
     """
     Query `incus list <name> --format json` and extract the best global-scope
@@ -170,7 +358,12 @@ def get_instance_ipv6(instance_name: str, iface: str = "eth0") -> str | None:
             timeout=10,
         )
         instances = json.loads(raw)
-    except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        FileNotFoundError,
+    ) as e:
         log.warning("get_instance_ipv6(%s) failed: %s", instance_name, e)
         return None
 
@@ -199,6 +392,7 @@ def get_instance_ipv6(instance_name: str, iface: str = "eth0") -> str | None:
 # Monitor loop
 # ──────────────────────────────────────────────────────────────
 INTERESTING_ACTIONS = {
+    "instance-created",
     "instance-started",
     "instance-stopped",
     "instance-deleted",
@@ -247,8 +441,17 @@ def monitor(dns: TechnitiumClient, cfg: dict) -> None:
 
                 log.info("Event: %s  instance: %s", action, name)
 
-                if action in ("instance-stopped", "instance-deleted"):
+                if action == "instance-created":
+                    # This is the only path that may create a service CNAME.
+                    # In particular, Incus rebuilds emit update/start events.
+                    dns.seed_service_cname_on_creation(name)
+
+                elif action in ("instance-stopped", "instance-deleted"):
                     dns.delete_aaaa(name)
+                    if action == "instance-deleted" and dns.service_cname_state:
+                        # A later container genuinely created with the same
+                        # name gets its own one-time initialization event.
+                        dns.service_cname_state.forget_deleted_instance(name)
 
                 elif action in ("instance-started", "instance-updated", "network-state"):
                     if action == "instance-started":
@@ -295,8 +498,9 @@ def monitor(dns: TechnitiumClient, cfg: dict) -> None:
 # ──────────────────────────────────────────────────────────────
 def initial_sync(dns: TechnitiumClient, cfg: dict) -> None:
     """
-    Walk all running instances and ensure their DNS records are
-    correct before entering the event loop.
+    Walk all running instances and ensure their AAAA records are correct before
+    entering the event loop.  It deliberately does not create service CNAMEs:
+    aliases are only initialized by a future ``instance-created`` event.
     """
     iface = cfg.get("incus", {}).get("interface", "eth0")
     log.info("Running initial full sync …")
@@ -337,12 +541,23 @@ def main() -> None:
     cfg = load_config(config_path)
 
     tech_cfg = cfg["technitium"]
+    service_cname_state = None
+    if tech_cfg.get("service_zone"):
+        state_path = Path(tech_cfg.get(
+            "service_cname_state_path", DEFAULT_SERVICE_CNAME_STATE_PATH,
+        ))
+        service_cname_state = ServiceCnameState(state_path)
+        if service_cname_state.is_new:
+            # Never backfill CNAMEs for the instances that predate this state.
+            service_cname_state.initialize_existing_instances(get_instance_names())
     dns = TechnitiumClient(
-        base_url = tech_cfg["url"],
-        token    = tech_cfg["api_token"],
-        zone     = tech_cfg["zone"],
-        ttl      = int(tech_cfg.get("ttl", 300)),
-        ptr      = bool(tech_cfg.get("create_ptr", True)),
+        base_url     = tech_cfg["url"],
+        token        = tech_cfg["api_token"],
+        zone         = tech_cfg["zone"],
+        ttl          = int(tech_cfg.get("ttl", 300)),
+        ptr          = bool(tech_cfg.get("create_ptr", True)),
+        service_zone = tech_cfg.get("service_zone"),
+        service_cname_state = service_cname_state,
     )
 
     # Block until Technitium (which itself lives in a container) is reachable.
