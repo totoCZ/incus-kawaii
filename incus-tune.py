@@ -27,6 +27,17 @@ Per container, regardless of running state:
     container; a profile mounts net-inject alongside clat-inject, so this
     is guaranteed without us checking for it here.)
 
+  - Profile membership: every OCI container (`config["image.type"] ==
+    "oci"`) must carry both the `default` and `oci-defaults` profiles —
+    `oci-defaults` supplies OCI-specific config (currently DNS
+    nameservers/search) that plain non-OCI containers (e.g.
+    `hermes-sandbox`, a squashfs image) don't need and shouldn't get.
+    Nothing sets this at creation time (`incus init` only attaches
+    `default` unless `-p` is passed explicitly), so it's easy to create an
+    OCI container that silently lacks it. Purely additive — like the
+    limit reconciler, we only add a missing profile, never remove one, in
+    case it was deliberately detached.
+
   - Memory limits use `limits.memory.enforce = soft` (cgroup v2
     `memory.high`).  The kernel reclaims page cache and throttles before
     applying OOM; hard kill is reserved for genuine heap exhaustion, not
@@ -813,6 +824,36 @@ def assign_smart(
     return placement, metrics
 
 
+# ── profile helpers ────────────────────────────────────────────────────────────
+
+DEFAULT_PROFILE = "default"
+OCI_PROFILE = "oci-defaults"
+
+
+def desired_profiles(config: dict[str, str]) -> list[str]:
+    """Profiles a container must carry, purely additive.
+
+    Only OCI containers (`image.type == "oci"`) need `oci-defaults`; a
+    non-OCI container (e.g. a squashfs image like `hermes-sandbox`) has no
+    use for its OCI-only config (DNS nameservers/search) and shouldn't get
+    it. Every container is expected to carry `default` regardless.
+    """
+    if config.get("image.type") == "oci":
+        return [DEFAULT_PROFILE, OCI_PROFILE]
+    return [DEFAULT_PROFILE]
+
+
+def reconcile_profiles(name: str, config: dict[str, str], profiles: list[str]) -> bool:
+    """Add any missing required profile. Never removes an attached profile."""
+    changed = False
+    for p in desired_profiles(config):
+        if p not in profiles:
+            subprocess.run(["incus", "profile", "add", name, p], check=True)
+            print(f"  {name}: profile + {p}")
+            changed = True
+    return changed
+
+
 # ── raw.lxc helpers ────────────────────────────────────────────────────────────
 
 MEMS_LINE_PREFIX = "lxc.cgroup2.cpuset.mems="
@@ -1025,6 +1066,7 @@ def main() -> int:
     devices_by_name = {c["name"]: (c.get("expanded_devices") or {}) for c in containers}
     running_by_name = {c["name"]: (c.get("status") == "Running")    for c in containers}
     configs_by_name = {c["name"]: (c.get("config") or {})           for c in containers}
+    profiles_by_name = {c["name"]: (c.get("profiles") or [])        for c in containers}
 
     # CPU source: Prometheus peak when reachable, else local lifetime average.
     use_prom = "--no-prom" not in sys.argv
@@ -1122,6 +1164,7 @@ def main() -> int:
         ch |= reconcile_limits(
             name, metrics[name], _node_capacity(desired[name])[1]
         )
+        ch |= reconcile_profiles(name, configs_by_name[name], profiles_by_name[name])
         any_changes |= ch
         if pages_stale:
             stale_pages.append(name)
