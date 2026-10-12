@@ -4,6 +4,19 @@ incus-dns-sync.py
 Watches `incus monitor` for instance state changes and syncs
 their IPv6 addresses as AAAA records into Technitium DNS
 under the zone  x.c.domain.tld
+
+Negative-caching policy: a downstream recursive resolver (unbound etc.)
+caches NXDOMAIN/NODATA for the zone's SOA MINIMUM (RFC 2308), so a record
+withdrawn for even a second keeps failing lookups long after it is restored.
+Records therefore mirror *instance existence*, not runtime state:
+
+- stopped/frozen instances keep their AAAA (they keep their address
+  reservation too, and come back on the same address);
+- deletion is deferred by a grace period and re-checked, so rebuild
+  flows never expose a negative answer;
+- address changes are written add-first so the name never has zero records;
+- the SOA MINIMUM of managed zones is capped (max_negative_ttl) so any
+  negative answer that does leak is cached only briefly.
 """
 
 import json
@@ -12,6 +25,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from pathlib import Path
@@ -211,23 +225,136 @@ class TechnitiumClient:
         except Exception:
             return []
 
+    def list_zone_aaaa(self) -> list[dict]:
+        """Return every record in the managed zone (for orphan cleanup)."""
+        data = self._request(
+            "/api/zones/records/get",
+            {"domain": self.zone, "zone": self.zone, "listZone": "true"},
+        )
+        return data.get("response", {}).get("records", [])
+
+    def get_soa(self, zone: str) -> dict | None:
+        """Return the rData of the SOA record of *zone*, or None.
+
+        The API does not reliably filter by type at the zone apex (the NS
+        record comes back too), so select by record type explicitly.
+        """
+        data = self._request(
+            "/api/zones/records/get",
+            {"domain": zone, "zone": zone, "type": "SOA"},
+        )
+        for rec in data.get("response", {}).get("records", []):
+            if rec.get("type") == "SOA":
+                return rec.get("rData")
+        return None
+
+    def enforce_negative_ttl(self, max_negative_ttl: int) -> None:
+        """
+        Cap the SOA MINIMUM of the managed zones (RFC 2308: how long
+        downstream resolvers negative-cache NXDOMAIN/NODATA).  A transient
+        withdrawal is invisible to this daemon, but any negative answer a
+        resolver did see keeps failing lookups for this long even after the
+        record is back — so keep it small.  Positive answers are unaffected
+        (they use each record's own TTL).
+        """
+        for zone in dict.fromkeys(z for z in (self.zone, self.service_zone) if z):
+            try:
+                rdata = self.get_soa(zone)
+                if not rdata:
+                    log.warning("No SOA record in zone %s; skipping negative-TTL cap.", zone)
+                    continue
+                minimum = int(rdata.get("minimum", 0))
+                if minimum <= max_negative_ttl:
+                    log.info("Zone %s negative TTL (SOA minimum) %ds is within cap %ds.",
+                             zone, minimum, max_negative_ttl)
+                    continue
+                self._request(
+                    "/api/zones/records/update",
+                    {
+                        "zone":                zone,
+                        "domain":              zone,
+                        "type":                "SOA",
+                        "primaryNameServer":   rdata.get("primaryNameServer", ""),
+                        "responsiblePerson":   rdata.get("responsiblePerson", ""),
+                        "serial":              str(rdata.get("serial", 0)),
+                        "refresh":             str(rdata.get("refresh", 900)),
+                        "retry":               str(rdata.get("retry", 300)),
+                        "expire":              str(rdata.get("expire", 604800)),
+                        "minimum":             str(max_negative_ttl),
+                        "useSerialDateScheme": "true" if rdata.get("useSerialDateScheme") else "false",
+                    },
+                )
+                log.info("Capped negative TTL (SOA minimum) of %s: %ds → %ds.",
+                         zone, minimum, max_negative_ttl)
+            except Exception as exc:
+                log.warning("Could not cap negative TTL on zone %s: %s", zone, exc)
+
     def upsert_aaaa(self, name: str, ipv6: str) -> None:
         """
         Add or update an AAAA record for *name* (short label, not FQDN).
         Service CNAME handling is intentionally separate from DNS syncing.
+
+        The correct record is always written *before* stale ones are removed,
+        so the name never has zero records: a momentary NXDOMAIN would be
+        negative-cached downstream (RFC 2308) and outlive the change.
         """
         fqdn = f"{name}.{self.zone}"
         existing = self.list_records(fqdn)
 
-        # If the exact record already exists, skip.
+        by_ip: dict[str, dict] = {}
         for rec in existing:
-            if rec.get("rData", {}).get("ipAddress") == ipv6:
-                log.info("AAAA %s → %s already correct, skipping.", fqdn, ipv6)
-                return
+            ip = rec.get("rData", {}).get("ipAddress")
+            if ip:
+                by_ip[ip] = rec
 
-        # Delete stale records first (same name, different address).
-        for rec in existing:
-            old_ip = rec.get("rData", {}).get("ipAddress", "")
+        need_add    = ipv6 not in by_ip
+        need_ttl    = (not need_add
+                       and int(by_ip[ipv6].get("ttl", 0)) != self.ttl)
+        stale_ips   = [ip for ip in by_ip if ip != ipv6]
+
+        if not (need_add or need_ttl or stale_ips):
+            log.info("AAAA %s → %s already correct, skipping.", fqdn, ipv6)
+            return
+
+        if need_add:
+            add_params = {
+                "zone":           self.zone,
+                "domain":         fqdn,
+                "type":           "AAAA",
+                "ttl":            str(self.ttl),
+                "ipAddress":      ipv6,
+                "ptr": "true" if self.ptr else "false",
+            }
+            log.info("Adding AAAA %s → %s (TTL %d, PTR %s)", fqdn, ipv6, self.ttl, self.ptr)
+            try:
+                self._request("/api/zones/records/add", add_params)
+            except RuntimeError as exc:
+                if "ptr" not in str(exc).lower():
+                    raise
+                # The forward-zone write is the critical one; never let a
+                # reverse-zone permission problem take out name resolution.
+                log.warning(
+                    "PTR creation was denied for %s (%s); adding the AAAA "
+                    "without PTR.  Fix the API token's reverse-zone "
+                    "permissions to restore PTR updates.", fqdn, exc,
+                )
+                self._request("/api/zones/records/add", dict(add_params, ptr="false"))
+        elif need_ttl:
+            log.info("Refreshing TTL on AAAA %s → %s (%d → %d)",
+                     fqdn, ipv6, int(by_ip[ipv6].get("ttl", 0)), self.ttl)
+            self._request(
+                "/api/zones/records/update",
+                {
+                    "zone":      self.zone,
+                    "domain":    fqdn,
+                    "type":      "AAAA",
+                    "ipAddress": ipv6,
+                    "ttl":       str(self.ttl),
+                },
+            )
+
+        # Only now remove stale addresses (same name, different IP).
+        for old_ip in stale_ips:
             log.info("Removing stale AAAA %s → %s", fqdn, old_ip)
             self._request(
                 "/api/zones/records/delete",
@@ -238,20 +365,6 @@ class TechnitiumClient:
                     "ipAddress":   old_ip,
                 },
             )
-
-        # Add the new record.
-        log.info("Adding AAAA %s → %s (TTL %d, PTR %s)", fqdn, ipv6, self.ttl, self.ptr)
-        self._request(
-            "/api/zones/records/add",
-            {
-                "zone":           self.zone,
-                "domain":         fqdn,
-                "type":           "AAAA",
-                "ttl":            str(self.ttl),
-                "ipAddress":      ipv6,
-                "ptr": "true" if self.ptr else "false",
-            },
-        )
 
     def delete_aaaa(self, name: str) -> None:
         """Remove *all* AAAA records for *name* from the zone."""
@@ -344,6 +457,29 @@ def get_instance_names() -> list[str]:
         raise RuntimeError("cannot list Incus instances for service-CNAME baseline") from exc
 
 
+def instance_exists(instance_name: str) -> bool:
+    """True if an Incus instance with this name currently exists.
+
+    Fails *safe*: on any Incus error we report True so callers keep DNS
+    records rather than deleting them based on a missing answer.
+    """
+    try:
+        raw = subprocess.check_output(
+            ["incus", "list", instance_name, "--format", "json"],
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        return bool(json.loads(raw))
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        json.JSONDecodeError,
+        FileNotFoundError,
+    ) as exc:
+        log.warning("instance_exists(%s) failed: %s — assuming it exists", instance_name, exc)
+        return True
+
+
 def get_instance_ipv6(instance_name: str, iface: str = "eth0") -> str | None:
     """
     Query `incus list <name> --format json` and extract the best global-scope
@@ -389,6 +525,56 @@ def get_instance_ipv6(instance_name: str, iface: str = "eth0") -> str | None:
 
 
 # ──────────────────────────────────────────────────────────────
+# Deferred AAAA deletion
+# ──────────────────────────────────────────────────────────────
+class DeletionScheduler:
+    """Withdraw an instance's AAAA only after a grace period, re-checked.
+
+    An ``instance-deleted`` event can be part of a rebuild (delete +
+    re-create with the same name).  Deleting DNS immediately would expose a
+    negative answer that downstream resolvers cache for the zone's negative
+    TTL.  The timer is cancelled by any event proving the name is alive
+    again, and re-verifies existence before it actually deletes.
+    """
+
+    def __init__(self, dns: TechnitiumClient, grace_seconds: float):
+        self.dns = dns
+        self.grace_seconds = grace_seconds
+        self._timers: dict[str, threading.Timer] = {}
+        self._lock = threading.Lock()
+
+    def schedule(self, name: str) -> None:
+        with self._lock:
+            old = self._timers.pop(name, None)
+            if old:
+                old.cancel()
+            timer = threading.Timer(self.grace_seconds, self._fire, args=(name,))
+            timer.daemon = True
+            self._timers[name] = timer
+        timer.start()
+        log.info("Instance %s deleted; AAAA withdrawal deferred %ss for possible rebuild.",
+                 name, self.grace_seconds)
+
+    def cancel(self, name: str) -> None:
+        with self._lock:
+            timer = self._timers.pop(name, None)
+        if timer:
+            timer.cancel()
+            log.info("Instance %s is back; cancelled deferred AAAA withdrawal.", name)
+
+    def _fire(self, name: str) -> None:
+        with self._lock:
+            self._timers.pop(name, None)
+        try:
+            if instance_exists(name):
+                log.info("Instance %s exists again; keeping its AAAA.", name)
+                return
+            self.dns.delete_aaaa(name)
+        except Exception as exc:
+            log.warning("Deferred AAAA withdrawal for %s failed: %s", name, exc)
+
+
+# ──────────────────────────────────────────────────────────────
 # Monitor loop
 # ──────────────────────────────────────────────────────────────
 INTERESTING_ACTIONS = {
@@ -404,11 +590,18 @@ def monitor(dns: TechnitiumClient, cfg: dict) -> None:
     """
     Stream `incus monitor --type lifecycle` and react to events.
     Reconnects automatically on process crash / socket error.
+
+    Records mirror instance *existence*: stopped/frozen instances keep
+    their AAAA (they keep their address reservation and come back on the
+    same address), and deletions go through DeletionScheduler.
     """
     iface        = cfg.get("incus", {}).get("interface", "eth0")
     start_grace  = float(cfg.get("incus", {}).get("start_grace_seconds", 4))
     slaac_retry_interval = float(cfg.get("incus", {}).get("slaac_retry_interval", 3))
     slaac_retry_timeout  = float(cfg.get("incus", {}).get("slaac_retry_timeout", 30))
+    deletions = DeletionScheduler(
+        dns, float(cfg.get("incus", {}).get("delete_grace_seconds", 120)),
+    )
 
     log.info("Starting incus monitor loop …")
     while True:
@@ -441,40 +634,59 @@ def monitor(dns: TechnitiumClient, cfg: dict) -> None:
 
                 log.info("Event: %s  instance: %s", action, name)
 
-                if action == "instance-created":
-                    # This is the only path that may create a service CNAME.
-                    # In particular, Incus rebuilds emit update/start events.
-                    dns.seed_service_cname_on_creation(name)
+                # One instance's DNS failure must never stop syncing the
+                # others (or kill the monitor): log it and carry on.
+                try:
+                    if action == "instance-created":
+                        # This is the only path that may create a service CNAME.
+                        # In particular, Incus rebuilds emit update/start events.
+                        deletions.cancel(name)
+                        dns.seed_service_cname_on_creation(name)
 
-                elif action in ("instance-stopped", "instance-deleted"):
-                    dns.delete_aaaa(name)
-                    if action == "instance-deleted" and dns.service_cname_state:
-                        # A later container genuinely created with the same
-                        # name gets its own one-time initialization event.
-                        dns.service_cname_state.forget_deleted_instance(name)
+                    elif action == "instance-stopped":
+                        # A stopped container keeps its name, MAC and address
+                        # reservation, and restarts onto the same address.
+                        # Removing DNS here would let downstream resolvers
+                        # negative-cache the name (RFC 2308) for the whole
+                        # update/repair window and beyond.
+                        log.info("Instance %s stopped; keeping its AAAA while it exists.", name)
 
-                elif action in ("instance-started", "instance-updated", "network-state"):
-                    if action == "instance-started":
-                        log.debug("Waiting %.0fs for %s to acquire IPv6 …", start_grace, name)
-                        time.sleep(start_grace)
+                    elif action == "instance-deleted":
+                        # Defer withdrawal so a delete + re-create rebuild never
+                        # exposes a negative answer; re-checked before deleting.
+                        deletions.schedule(name)
+                        if dns.service_cname_state:
+                            # A later container genuinely created with the same
+                            # name gets its own one-time initialization event.
+                            dns.service_cname_state.forget_deleted_instance(name)
 
-                    ipv6 = get_instance_ipv6(name, iface)
-                    if ipv6:
-                        dns.upsert_aaaa(name, ipv6)
-                    elif action == "instance-started":
-                        # SLAAC may not have completed yet; poll until we get an address.
-                        deadline = time.monotonic() + slaac_retry_timeout
-                        while time.monotonic() < deadline:
-                            time.sleep(slaac_retry_interval)
-                            ipv6 = get_instance_ipv6(name, iface)
-                            if ipv6:
-                                dns.upsert_aaaa(name, ipv6)
-                                break
-                            log.debug("Still no IPv6 for %s, retrying …", name)
+                    elif action in ("instance-started", "instance-updated", "network-state"):
+                        deletions.cancel(name)
+                        if action == "instance-started":
+                            log.debug("Waiting %.0fs for %s to acquire IPv6 …", start_grace, name)
+                            time.sleep(start_grace)
+
+                        ipv6 = get_instance_ipv6(name, iface)
+                        if ipv6:
+                            dns.upsert_aaaa(name, ipv6)
+                        elif action == "instance-started":
+                            # SLAAC may not have completed yet; poll until we get an address.
+                            deadline = time.monotonic() + slaac_retry_timeout
+                            while time.monotonic() < deadline:
+                                time.sleep(slaac_retry_interval)
+                                ipv6 = get_instance_ipv6(name, iface)
+                                if ipv6:
+                                    dns.upsert_aaaa(name, ipv6)
+                                    break
+                                log.debug("Still no IPv6 for %s, retrying …", name)
+                            else:
+                                log.warning("No global IPv6 found for %s after %.0fs, giving up.", name, slaac_retry_timeout)
                         else:
-                            log.warning("No global IPv6 found for %s after %.0fs, giving up.", name, slaac_retry_timeout)
-                    else:
-                        log.warning("No global IPv6 found for %s, will retry on next event.", name)
+                            log.warning("No global IPv6 found for %s, will retry on next event.", name)
+
+                except Exception:
+                    log.exception("Failed to process %s for %s; continuing.",
+                                  action, name)
 
             proc.wait()
             stderr_out = proc.stderr.read().strip()
@@ -498,9 +710,13 @@ def monitor(dns: TechnitiumClient, cfg: dict) -> None:
 # ──────────────────────────────────────────────────────────────
 def initial_sync(dns: TechnitiumClient, cfg: dict) -> None:
     """
-    Walk all running instances and ensure their AAAA records are correct before
-    entering the event loop.  It deliberately does not create service CNAMEs:
-    aliases are only initialized by a future ``instance-created`` event.
+    Walk all instances and bring their AAAA records in line before entering
+    the event loop.  Records mirror existence, not runtime state: stopped or
+    frozen instances keep their AAAA; only records with no corresponding
+    instance at all are removed (orphan cleanup, which also covers
+    ``instance-deleted`` events missed while the daemon was down).
+    It deliberately does not create service CNAMEs: aliases are only
+    initialized by a future ``instance-created`` event.
     """
     iface = cfg.get("incus", {}).get("interface", "eth0")
     log.info("Running initial full sync …")
@@ -515,22 +731,56 @@ def initial_sync(dns: TechnitiumClient, cfg: dict) -> None:
         log.warning("Could not list instances for initial sync: %s", exc)
         return
 
+    live_names: set[str] = set()
     for inst in instances:
         name   = inst.get("name", "")
         status = inst.get("status", "").lower()
         if not name:
             continue
-        if status == "running":
-            ipv6 = get_instance_ipv6(name, iface)
-            if ipv6:
-                dns.upsert_aaaa(name, ipv6)
+        live_names.add(name)
+        try:
+            if status == "running":
+                ipv6 = get_instance_ipv6(name, iface)
+                if ipv6:
+                    dns.upsert_aaaa(name, ipv6)
+                else:
+                    log.warning("Running instance %s has no global IPv6 yet.", name)
             else:
-                log.warning("Running instance %s has no global IPv6 yet.", name)
-        else:
-            # Remove DNS for stopped/frozen instances.
-            dns.delete_aaaa(name)
+                # A stopped/frozen instance still owns its name and address
+                # reservation; withdrawing DNS here would negative-cache the
+                # name downstream for every restart, update and repair.
+                log.info("Instance %s is %s; keeping its AAAA while it exists.",
+                         name, status or "not running")
+        except Exception:
+            log.exception("Sync failed for instance %s; continuing.", name)
 
+    cleanup_orphan_records(dns, live_names)
     log.info("Initial sync complete.")
+
+
+def cleanup_orphan_records(dns: TechnitiumClient, live_names: set[str]) -> None:
+    """Remove AAAA records whose instance no longer exists at all."""
+    try:
+        records = dns.list_zone_aaaa()
+    except Exception as exc:
+        log.warning("Could not list zone records for orphan cleanup: %s", exc)
+        return
+
+    suffix = "." + dns.zone
+    for rec in records:
+        if rec.get("type") != "AAAA":
+            continue
+        fqdn = rec.get("name", "")
+        if not fqdn.endswith(suffix):
+            continue
+        label = fqdn[: -len(suffix)]
+        if label in live_names:
+            continue
+        log.info("Removing orphaned AAAA %s (no such Incus instance).", fqdn)
+        try:
+            dns.delete_aaaa(label)
+        except Exception as exc:
+            log.warning("Could not remove orphaned AAAA %s: %s", fqdn, exc)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -566,6 +816,9 @@ def main() -> None:
         retries = int(wait_cfg.get("retries", 36)),
         delay   = float(wait_cfg.get("delay_seconds", 5)),
     )
+
+    # Bound how long a downstream resolver can negative-cache our names.
+    dns.enforce_negative_ttl(int(tech_cfg.get("max_negative_ttl", 60)))
 
     initial_sync(dns, cfg)
     monitor(dns, cfg)
